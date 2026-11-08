@@ -41,14 +41,86 @@ pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
     }
 
     // 1. Find the observation age and account for launch latency.
+    let observation_age_s = input.now_s - observation.time_s;
+    let effective_age_s = observation_age_s + physics::OBSERVATION_DELAY_S + physics::LAUNCH_DELAY_S;
+    debug.overlay("Effective age", format!("{:.2}", effective_age_s));
+    for plate in observation.target.at(effective_age_s).plates(input.size) {
+        debug.plate(plate, input.size, Color::Green);
+    }
+
     // 2. Select an armor plate before solving its trajectory.
-    // 3. Solve a trajectory with Trajectory::solve.
+    let plates = observation.target.at(effective_age_s).plates(input.size);
+    let mut selected_plate = plates[0];
+    let mut closest_distance_sq = f64::INFINITY;
+
+    // Find the closest plate 
+    for plate in plates {
+        let distance_sq = plate.center_m.iter().zip(physics::MUZZLE_M).map(|(plate, muzzle)| (plate - muzzle).powi(2)).sum::<f64>();
+
+    if distance_sq < closest_distance_sq {
+        closest_distance_sq = distance_sq;
+        selected_plate = plate;
+    }
+    }
+
+    debug.plate(selected_plate, input.size, Color::Red);
+    
+    // 3. Predict the selected plate during projectile flight.
+    let mut predicted_target = observation.target.at(effective_age_s);
+    let mut predicted_plate = selected_plate;
+    let mut trajectory = None;
+
+    // loops to refine trajectory due to fight time
+    for _ in 0..10 {
+        let Some(current_trajectory) = Trajectory::solve(predicted_plate.center_m) else {
+            break;
+        };
+
+        predicted_target = observation
+            .target
+            .at(effective_age_s + current_trajectory.flight_time_s);
+        let future_plates = predicted_target.plates(input.size);
+        let mut closest_distance_sq = f64::INFINITY;
+        //find the closest plate at impact time
+        for plate in future_plates {
+            let distance_sq = plate
+                .center_m
+                .iter()
+                .zip(physics::MUZZLE_M)
+                .map(|(coordinate, muzzle)| (coordinate - muzzle).powi(2))
+                .sum::<f64>();
+
+            if distance_sq < closest_distance_sq {
+                closest_distance_sq = distance_sq;
+                predicted_plate = plate;
+            }
+        }
+    }
+
+    trajectory = Trajectory::solve(predicted_plate.center_m);
+
+    let Some(trajectory) = trajectory else {
+        debug.overlay("Trajectory", "Unreachable");
+        return None;
+    };
+
+    debug.plate(predicted_plate, input.size, Color::Red);
+    debug.trajectory(trajectory, Color::Orange);
+
+
     // 4. Aim at the future plate position using age, launch delay, and flight time.
+    Some(Command {
+        yaw_rad: trajectory.yaw_rad,
+        pitch_rad: trajectory.pitch_rad,
+        fire: true,
+    })
     // Optional drawings for your solution:
     // debug.plate(predicted_plate, input.size, Color::Green);
     // debug.trajectory(trajectory, Color::Orange);
-    None
 }
+
+
+    
 
 /// The only simulation data provided to the applicant's controller.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
