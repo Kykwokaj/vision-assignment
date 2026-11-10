@@ -1,5 +1,6 @@
 
 import json
+import argparse
 
 import numpy as np
 import cv2
@@ -8,6 +9,10 @@ import yaml
 
 PATH = "C:\\Users\\kaiyi\\Desktop\\vision\\vision-assignment\\detection\\assets\\large.mp4"
 MODEL = "C:\\Users\\kaiyi\\Desktop\\vision\\vision-assignment\\detection\\assets\\0526.onnx"
+
+IMPUT_SIZE = 640
+FPS = 30.0
+
 COLORS   = ["blue", "red", "neutral", "purple"]
 PATTERNS = ["sentry", "1", "2", "3", "4", "5", "outpost", "base_small", "base_big"]
 
@@ -21,7 +26,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    ##-------------------------------Open video and read a frame--------------------------------
+#-------------------------------Open video and read a frame--------------------------------
     cap = cv2.VideoCapture(PATH)
     if not cap.isOpened():
         print("Error: Could not open video.")
@@ -42,7 +47,7 @@ def main():
     # cv2.imshow("Letterboxed Image", img)
     # cv2.waitKey(0)
     # cv2.destroyAllWindows()
-
+    K, dist = load_calibration(args.calibration)       # once, next to the ONNX session
     session = ort.InferenceSession(MODEL, providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
     tensor = to_tensor(img)
@@ -54,7 +59,7 @@ def main():
     # for d in dets:
     #     d["corners_px"] = unletterbox(d["corners"], scale, pad_x, pad_y)
     # # print("detections:", dets)
-    # K, dist = load_calibration(args.calibration)       # once, next to the ONNX session
+
 
     # for d in dets:
     #     d["corners_px"] = unletterbox(d["corners"], scale, pad_x, pad_y)
@@ -82,7 +87,27 @@ def main():
     if frame_index == 0:
         print("Error: video contains no frames")
     
-   
+def process_frame(frame, session, input_name, K, dist, conf_thr=0.5, iou_thr=0.5):
+    img, scale,pad_x, pad_y = letterbox(frame)
+    raw = session.run(None, {input_name: to_tensor(img)})[0][0] #get the raw output from the model
+    dets = nms(decode(raw, conf_thr), iou_thr) #run model
+
+    results = []
+    for d in dets:
+         corners_px = unletterbox(d["corners"], scale, pad_x, pad_y)
+         corners_camera_m, reprojection_error_px = solve_pose(d["corners_px"], d["pattern"], K, dist)
+         results.append({
+            "color": d["color"],
+            "pattern": d["pattern"],
+            "confidence": d["confidence"],
+            "corners_px": corners_px.astype(np.float32).tolist(), #raw coners coordinates
+            "corners_camera_m": corners_camera_m.tolist() if corners_camera_m is not None else None, # coners coordinates in camera frame
+            "reprojection_error_px": reprojection_error_px,
+         })
+    return results
+
+#-------------------------------Helper functions--------------------------------
+#-------------------------------Preprocess -------------------------------------
 def letterbox(frame, size=640):
     h, w = frame.shape[:2]
     scale = min(size / w, size / h)                  
@@ -91,6 +116,10 @@ def letterbox(frame, size=640):
     pad_x, pad_y = (size - nw) // 2, (size - nh) // 2  
     canvas = np.full((size, size, 3), 114, dtype=np.uint8) 
     canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+    # cv2.rectangle(canvas, (pad_x, pad_y), (pad_x + nw, pad_y + nh), (0, 255, 0), 2)
+    # cv2.imshow("Letterboxed Image", canvas)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
     return canvas, scale, pad_x, pad_y
 
 def to_tensor(img):
@@ -98,14 +127,14 @@ def to_tensor(img):
     x = rgb.astype(np.float32) / 255.0           
     x = x.transpose(2, 0, 1)[None]               # HWC → CHW, add batch: (1, 3, 640, 640)
     return np.ascontiguousarray(x, dtype=np.float16)  
-
+#-------------------------------decoding -------------------------------------
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 def decode(raw, conf_thr=0.5):
-    conf = sigmoid(raw[:, 8])            # objectness logit → probability
-    keep = conf > conf_thr               # filter first: 25200 rows → a handful
+    conf = sigmoid(raw[:, 8])            # objectness logit -> probability
+    keep = conf > conf_thr               # filter first: 25200 rows -> a handful
     dets = []
     for row, c in zip(raw[keep], conf[keep]):
         dets.append({
@@ -121,14 +150,14 @@ def box_of(corners):
     x2, y2 = corners.max(axis=0)
     return x1, y1, x2, y2
 
-def iou(a, b):
+def iou(a, b): # intersection over union
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
     ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
     inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
     union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
     return inter / union if union > 0 else 0.0
 
-def nms(dets, iou_thr=0.5):
+def nms(dets, iou_thr=0.5): # non-maximum suppression
     dets = sorted(dets, key=lambda d: d["confidence"], reverse=True)
     kept = []
     for d in dets:
@@ -141,6 +170,7 @@ def unletterbox(corners, scale, pad_x, pad_y):
     """corners: (4, 2) in 640×640 model space → (4, 2) in original image pixels"""
     return (corners - np.array([pad_x, pad_y], dtype=np.float32)) / scale
 
+#-------------------------------PnP -------------------------------------
 SMALL = (0.135, 0.056)   # width, height in metres
 LARGE = (0.230, 0.056)
 LARGE_PATTERNS = {"1", "base_big"}
@@ -169,8 +199,8 @@ def solve_pose(corners_px, pattern, K, dist):
 
     best = None
     for rvec, tvec in zip(rvecs, tvecs):          # IPPE gives up to 2 candidates
-        R, _ = cv2.Rodrigues(rvec)                # rotation vector → 3×3 matrix
-        cam = (R @ obj.T + tvec.reshape(3, 1)).T  # each physical corner → camera frame
+        R, _ = cv2.Rodrigues(rvec)                # rotation vector -> 3×3 matrix
+        cam = (R @ obj.T + tvec.reshape(3, 1)).T  # each physical corner -> camera frame
         if np.any(cam[:, 2] <= 0):                # must be in front of the camera
             continue
         proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
@@ -184,4 +214,3 @@ def solve_pose(corners_px, pattern, K, dist):
 
 if __name__ == "__main__":
     main()
-
